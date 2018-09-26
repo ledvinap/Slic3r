@@ -1,31 +1,21 @@
 %module{Slic3r::XS};
 
 %{
-#include <myinit.h>
-#include "SurfaceCollection.hpp"
+#include <xsinit.h>
+#include "libslic3r/SurfaceCollection.hpp"
 %}
 
 %name{Slic3r::Surface::Collection} class SurfaceCollection {
+    %name{_new} SurfaceCollection();
     ~SurfaceCollection();
     void clear()
         %code{% THIS->surfaces.clear(); %};
+    void append(Surface* surface)
+        %code{% THIS->surfaces.push_back(*surface); %};
     int count()
         %code{% RETVAL = THIS->surfaces.size(); %};
     void simplify(double tolerance);
 %{
-
-SurfaceCollection*
-SurfaceCollection::new(...)
-    CODE:
-        RETVAL = new SurfaceCollection;
-        // ST(0) is class name, others are surfaces
-        RETVAL->surfaces.resize(items-1);
-        for (unsigned int i = 1; i < items; i++) {
-            // Note: a COPY of the input is stored
-            RETVAL->surfaces[i-1].from_SV_check(ST(i));
-        }
-    OUTPUT:
-        RETVAL
 
 SV*
 SurfaceCollection::arrayref()
@@ -34,7 +24,7 @@ SurfaceCollection::arrayref()
         av_fill(av, THIS->surfaces.size()-1);
         int i = 0;
         for (Surfaces::iterator it = THIS->surfaces.begin(); it != THIS->surfaces.end(); ++it) {
-            av_store(av, i++, (*it).to_SV_ref());
+            av_store(av, i++, perl_to_SV_ref(*it));
         }
         RETVAL = newRV_noinc((SV*)av);
     OUTPUT:
@@ -46,20 +36,11 @@ SurfaceCollection::filter_by_type(surface_type)
     CODE:
         AV* av = newAV();
         for (Surfaces::iterator it = THIS->surfaces.begin(); it != THIS->surfaces.end(); ++it) {
-            if ((*it).surface_type == surface_type) av_push(av, (*it).to_SV_ref());
+            if ((*it).surface_type == surface_type) av_push(av, perl_to_SV_ref(*it));
         }
         RETVAL = newRV_noinc((SV*)av);
     OUTPUT:
         RETVAL
-
-void
-SurfaceCollection::append(...)
-    CODE:
-        for (unsigned int i = 1; i < items; i++) {
-            Surface surface;
-            surface.from_SV_check( ST(i) );
-            THIS->surfaces.push_back(surface);
-        }
 
 void
 SurfaceCollection::replace(index, surface)
@@ -79,19 +60,19 @@ SV*
 SurfaceCollection::group()
     CODE:
         // perform grouping
-        std::vector<SurfacesPtr> groups;
+        std::vector<SurfacesConstPtr> groups;
         THIS->group(&groups);
         
         // build return arrayref
         AV* av = newAV();
         av_fill(av, groups.size()-1);
         size_t i = 0;
-        for (std::vector<SurfacesPtr>::iterator it = groups.begin(); it != groups.end(); ++it) {
+        for (std::vector<SurfacesConstPtr>::const_iterator it = groups.begin(); it != groups.end(); ++it) {
             AV* innerav = newAV();
             av_fill(innerav, it->size()-1);
             size_t j = 0;
-            for (SurfacesPtr::iterator it_s = it->begin(); it_s != it->end(); ++it_s) {
-                av_store(innerav, j++, (*it_s)->to_SV_clone_ref());
+            for (SurfacesConstPtr::const_iterator it_s = it->begin(); it_s != it->end(); ++it_s) {
+                av_store(innerav, j++, perl_to_SV_clone_ref(**it_s));
             }
             av_store(av, i++, newRV_noinc((SV*)innerav));
         }

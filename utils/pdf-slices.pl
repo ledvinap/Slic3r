@@ -7,6 +7,7 @@ use warnings;
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
 use Getopt::Long qw(:config no_auto_abbrev);
@@ -31,13 +32,14 @@ my %opt = ();
     # prepare config
     my $config = Slic3r::Config->new;
     $config->set('layer_height', $opt{layer_height}) if $opt{layer_height};
-    $config->set('print_center', [0,0]);
     
     # read model
     my $model = Slic3r::Model->read_from_file(my $input_file = $ARGV[0]);
     
     # init print object
-    my $sprint = Slic3r::Print::Simple->new;
+    my $sprint = Slic3r::Print::Simple->new(
+        print_center => [0,0],
+    );
     $sprint->apply_config($config);
     $sprint->set_model($model);
     my $print = $sprint->_print;

@@ -7,6 +7,7 @@ use warnings;
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
 use File::Basename qw(basename);
@@ -25,20 +26,25 @@ my %opt = ();
 }
 
 {
-    my $model = Slic3r::Format::STL->read_file($ARGV[0]);
+    my $model = Slic3r::Model->read_from_file($ARGV[0]);
     my $basename = $ARGV[0];
     $basename =~ s/\.stl$//i;
     
     my $part_count = 0;
-    foreach my $new_mesh ($model->mesh->split_mesh) {
+    my $mesh = $model->objects->[0]->volumes->[0]->mesh;
+    foreach my $new_mesh (@{$mesh->split}) {
+        $new_mesh->repair;
+        
         my $new_model = Slic3r::Model->new;
         $new_model
-            ->add_object(vertices   => $new_mesh->vertices)
-            ->add_volume(facets     => $new_mesh->facets);
+            ->add_object()
+            ->add_volume(mesh => $new_mesh);
+        
+        $new_model->add_default_instances;
         
         my $output_file = sprintf '%s_%02d.stl', $basename, ++$part_count;
         printf "Writing to %s\n", basename($output_file);
-        Slic3r::Format::STL->write_file($output_file, $new_model, binary => !$opt{ascii});
+        $new_model->write_stl($output_file, !$opt{ascii});
     }
 }
 

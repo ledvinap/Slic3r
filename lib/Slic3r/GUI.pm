@@ -3,241 +3,212 @@ use strict;
 use warnings;
 use utf8;
 
+use Wx 0.9901 qw(:bitmap :dialog :icon :id :misc :systemsettings :toplevelwindow
+    :filedialog :font);
+use Wx::Event qw(EVT_MENU);
+
+BEGIN {
+    # Wrap the Wx::_load_plugin() function which doesn't work with non-ASCII paths
+    no warnings 'redefine';
+    my $orig = *Wx::_load_plugin{CODE};
+    *Wx::_load_plugin = sub {
+       $_[0] = Slic3r::decode_path($_[0]);
+       $orig->(@_);
+    };
+}
+
 use File::Basename qw(basename);
 use FindBin;
+use List::Util qw(first any);
+use Slic3r::Geometry qw(X Y);
+
+use Slic3r::GUI::2DBed;
 use Slic3r::GUI::AboutDialog;
+use Slic3r::GUI::BedShapeDialog;
+use Slic3r::GUI::BonjourBrowser;
 use Slic3r::GUI::ConfigWizard;
+use Slic3r::GUI::Controller;
+use Slic3r::GUI::Controller::ManualControlDialog;
+use Slic3r::GUI::Controller::PrinterPanel;
+use Slic3r::GUI::MainFrame;
+use Slic3r::GUI::Notifier;
 use Slic3r::GUI::Plater;
+use Slic3r::GUI::Plater::2D;
+use Slic3r::GUI::Plater::2DToolpaths;
+use Slic3r::GUI::Plater::3D;
+use Slic3r::GUI::Plater::3DPreview;
 use Slic3r::GUI::Plater::ObjectPartsPanel;
-use Slic3r::GUI::Plater::ObjectPreviewDialog;
+use Slic3r::GUI::Plater::ObjectCutDialog;
+use Slic3r::GUI::Plater::ObjectRotateFaceDialog;
 use Slic3r::GUI::Plater::ObjectSettingsDialog;
+use Slic3r::GUI::Plater::LambdaObjectDialog;
 use Slic3r::GUI::Plater::OverrideSettingsPanel;
+use Slic3r::GUI::Plater::SplineControl;
 use Slic3r::GUI::Preferences;
+use Slic3r::GUI::ProgressStatusBar;
+use Slic3r::GUI::Projector;
 use Slic3r::GUI::OptionsGroup;
-use Slic3r::GUI::SkeinPanel;
-use Slic3r::GUI::SimpleTab;
-use Slic3r::GUI::Tab;
+use Slic3r::GUI::OptionsGroup::Field;
+use Slic3r::GUI::Preset;
+use Slic3r::GUI::PresetEditor;
+use Slic3r::GUI::PresetEditorDialog;
+use Slic3r::GUI::SLAPrintOptions;
+use Slic3r::GUI::ReloadDialog;
 
-our $have_OpenGL = eval "use Slic3r::GUI::PreviewCanvas; 1";
+our $have_OpenGL = eval "use Slic3r::GUI::3DScene; 1";
+our $have_LWP    = eval "use LWP::UserAgent; 1";
 
-use Wx 0.9901 qw(:bitmap :dialog :frame :icon :id :misc :systemsettings :toplevelwindow
-    :filedialog);
-use Wx::Event qw(EVT_CLOSE EVT_MENU EVT_IDLE);
+use Wx::Event qw(EVT_IDLE EVT_COMMAND);
 use base 'Wx::App';
 
-use constant MI_LOAD_CONF     => &Wx::NewId;
-use constant MI_LOAD_CONFBUNDLE => &Wx::NewId;
-use constant MI_EXPORT_CONF   => &Wx::NewId;
-use constant MI_EXPORT_CONFBUNDLE => &Wx::NewId;
-use constant MI_QUICK_SLICE   => &Wx::NewId;
-use constant MI_REPEAT_QUICK  => &Wx::NewId;
-use constant MI_QUICK_SAVE_AS => &Wx::NewId;
-use constant MI_SLICE_SVG     => &Wx::NewId;
-use constant MI_REPAIR_STL    => &Wx::NewId;
-use constant MI_COMBINE_STLS  => &Wx::NewId;
-
-use constant MI_PLATER_EXPORT_GCODE => &Wx::NewId;
-use constant MI_PLATER_EXPORT_STL   => &Wx::NewId;
-use constant MI_PLATER_EXPORT_AMF   => &Wx::NewId;
-
-use constant MI_TAB_PLATER    => &Wx::NewId;
-use constant MI_TAB_PRINT     => &Wx::NewId;
-use constant MI_TAB_FILAMENT  => &Wx::NewId;
-use constant MI_TAB_PRINTER   => &Wx::NewId;
-
-use constant MI_CONF_WIZARD   => &Wx::NewId;
-use constant MI_WEBSITE       => &Wx::NewId;
-use constant MI_VERSIONCHECK  => &Wx::NewId;
-use constant MI_DOCUMENTATION => &Wx::NewId;
+use constant FILE_WILDCARDS => {
+    known   => 'Known files (*.stl, *.obj, *.amf, *.xml, *.3mf)|*.3mf;*.3MF;*.stl;*.STL;*.obj;*.OBJ;*.amf;*.AMF;*.xml;*.XML',
+    stl     => 'STL files (*.stl)|*.stl;*.STL',
+    obj     => 'OBJ files (*.obj)|*.obj;*.OBJ',
+    amf     => 'AMF files (*.amf)|*.amf;*.AMF;*.xml;*.XML',
+    tmf     => '3MF files (*.3mf)|*.3mf;*.3MF',
+    ini     => 'INI files *.ini|*.ini;*.INI',
+    gcode   => 'G-code files (*.gcode, *.gco, *.g, *.ngc)|*.gcode;*.GCODE;*.gco;*.GCO;*.g;*.G;*.ngc;*.NGC',
+    svg     => 'SVG files *.svg|*.svg;*.SVG',
+};
+use constant MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(known stl obj amf tmf)};
+use constant STL_MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(stl)};
+use constant AMF_MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(amf)};
+use constant TMF_MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(tmf)};
 
 our $datadir;
-our $no_plater;
-our $mode;
+# If set, the "Controller" tab for the control of the printer over serial line and the serial port settings are hidden.
 our $autosave;
+our $threads;
 our @cb;
 
 our $Settings = {
     _ => {
-        mode => 'simple',
         version_check => 1,
         autocenter => 1,
+        autoalignz => 1,
+        invert_zoom => 0,
+        background_processing => 0,
+        threads => $Slic3r::Config::Options->{threads}{default},
+        color_toolpaths_by => 'role',
+        tabbed_preset_editors => 1,
+        show_host => 0,
+        nudge_val => 1,
+        reload_hide_dialog => 0,
+        reload_behavior => 0
     },
 };
 
-our $have_button_icons = &Wx::wxVERSION_STRING =~ / 2\.9\.[1-9]/;
+our $have_button_icons = &Wx::wxVERSION_STRING =~ / (?:2\.9\.[1-9]|3\.)/;
 our $small_font = Wx::SystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT);
-$small_font->SetPointSize(11) if !&Wx::wxMSW;
+$small_font->SetPointSize(11) if &Wx::wxMAC;
+our $small_bold_font = Wx::SystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT);
+$small_bold_font->SetPointSize(11) if &Wx::wxMAC;
+$small_bold_font->SetWeight(wxFONTWEIGHT_BOLD);
 our $medium_font = Wx::SystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT);
 $medium_font->SetPointSize(12);
+our $grey = Wx::Colour->new(200,200,200);
+
+# to use in ScrolledWindow::SetScrollRate(xstep, ystep)
+# step related to system font point size
+our $scroll_step = Wx::SystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT)->GetPointSize;
+
+our $VERSION_CHECK_EVENT : shared = Wx::NewEventType;
+
+our $DLP_projection_screen;
 
 sub OnInit {
-    my $self = shift;
+    my ($self) = @_;
     
     $self->SetAppName('Slic3r');
     Slic3r::debugf "wxWidgets version %s, Wx version %s\n", &Wx::wxVERSION_STRING, $Wx::VERSION;
     
     $self->{notifier} = Slic3r::GUI::Notifier->new;
+    $self->{presets} = { print => [], filament => [], printer => [] };
     
     # locate or create data directory
-    $datadir ||= Wx::StandardPaths::Get->GetUserDataDir;
-    $datadir = Slic3r::encode_path($datadir);
+    # Unix: ~/.Slic3r
+    # Windows: "C:\Users\username\AppData\Roaming\Slic3r" or "C:\Documents and Settings\username\Application Data\Slic3r"
+    # Mac: "~/Library/Application Support/Slic3r"
+    $datadir ||= Slic3r::decode_path(Wx::StandardPaths::Get->GetUserDataDir);
+    my $enc_datadir = Slic3r::encode_path($datadir);
     Slic3r::debugf "Data directory: %s\n", $datadir;
     
     # just checking for existence of $datadir is not enough: it may be an empty directory
     # supplied as argument to --datadir; in that case we should still run the wizard
-    my $run_wizard = (-d $datadir && -e "$datadir/slic3r.ini") ? 0 : 1;
-    for ($datadir, "$datadir/print", "$datadir/filament", "$datadir/printer") {
-        mkdir or $self->fatal_error("Slic3r was unable to create its data directory at $_ (errno: $!).")
-            unless -d $_;
+    my $run_wizard = (-d $enc_datadir && -e "$enc_datadir/slic3r.ini") ? 0 : 1;
+    foreach my $dir ($enc_datadir, "$enc_datadir/print", "$enc_datadir/filament", "$enc_datadir/printer") {
+        next if -d $dir;
+        if (!mkdir $dir) {
+            my $error = "Slic3r was unable to create its data directory at $dir ($!).";
+            warn "$error\n";
+            fatal_error(undef, $error);
+        }
     }
     
     # load settings
     my $last_version;
-    if (-f "$datadir/slic3r.ini") {
+    if (-f "$enc_datadir/slic3r.ini") {
         my $ini = eval { Slic3r::Config->read_ini("$datadir/slic3r.ini") };
-        $Settings = $ini if $ini;
-        $last_version = $Settings->{_}{version};
-        $Settings->{_}{mode} ||= 'expert';
-        $Settings->{_}{autocenter} //= 1;
+        if ($ini) {
+            $last_version = $ini->{_}{version};
+            $ini->{_}{$_} = $Settings->{_}{$_}
+                for grep !exists $ini->{_}{$_}, keys %{$Settings->{_}};
+            $Settings = $ini;
+        }
+        delete $Settings->{_}{mode};  # handle legacy
     }
     $Settings->{_}{version} = $Slic3r::VERSION;
-    Slic3r::GUI->save_settings;
+    $Settings->{_}{threads} = $threads if $threads;
+    $self->save_settings;
+    
+    if (-f "$enc_datadir/simple.ini") {
+        # The Simple Mode settings were already automatically duplicated to presets
+        # named "Simple Mode" in each group, so we already support retrocompatibility.
+        unlink "$enc_datadir/simple.ini";
+    }
+    
+    $self->load_presets;
     
     # application frame
     Wx::Image::AddHandler(Wx::PNGHandler->new);
-    my $frame = Wx::Frame->new(undef, -1, 'Slic3r', wxDefaultPosition, [760, 470], wxDEFAULT_FRAME_STYLE);
-    $frame->SetIcon(Wx::Icon->new("$Slic3r::var/Slic3r_128px.png", wxBITMAP_TYPE_PNG) );
-    $self->{skeinpanel} = Slic3r::GUI::SkeinPanel->new($frame,
-        mode        => $mode // $Settings->{_}{mode},
-        no_plater   => $no_plater,
-    );
+    $self->{mainframe} = my $frame = Slic3r::GUI::MainFrame->new;
     $self->SetTopWindow($frame);
     
-    # status bar
-    $frame->{statusbar} = Slic3r::GUI::ProgressStatusBar->new($frame, -1);
-    $frame->{statusbar}->SetStatusText("Version $Slic3r::VERSION - Remember to check for updates at http://slic3r.org/");
-    $frame->SetStatusBar($frame->{statusbar});
-    
-    # File menu
-    my $fileMenu = Wx::Menu->new;
+    # load init bundle
     {
-        $fileMenu->Append(MI_LOAD_CONF, "&Load Config…\tCtrl+L", 'Load exported configuration file');
-        $fileMenu->Append(MI_EXPORT_CONF, "&Export Config…\tCtrl+E", 'Export current configuration to file');
-        $fileMenu->Append(MI_LOAD_CONFBUNDLE, "&Load Config Bundle…", 'Load presets from a bundle');
-        $fileMenu->Append(MI_EXPORT_CONFBUNDLE, "&Export Config Bundle…", 'Export all presets to file');
-        $fileMenu->AppendSeparator();
-        $fileMenu->Append(MI_QUICK_SLICE, "Q&uick Slice…\tCtrl+U", 'Slice file');
-        $fileMenu->Append(MI_QUICK_SAVE_AS, "Quick Slice and Save &As…\tCtrl+Alt+U", 'Slice file and save as');
-        my $repeat = $fileMenu->Append(MI_REPEAT_QUICK, "&Repeat Last Quick Slice\tCtrl+Shift+U", 'Repeat last quick slice');
-        $repeat->Enable(0);
-        $fileMenu->AppendSeparator();
-        $fileMenu->Append(MI_SLICE_SVG, "Slice to SV&G…\tCtrl+G", 'Slice file to SVG');
-        $fileMenu->AppendSeparator();
-        $fileMenu->Append(MI_REPAIR_STL, "Repair STL file…", 'Automatically repair an STL file');
-        $fileMenu->Append(MI_COMBINE_STLS, "Combine multi-material STL files…", 'Combine multiple STL files into a single multi-material AMF file');
-        $fileMenu->AppendSeparator();
-        $fileMenu->Append(wxID_PREFERENCES, "Preferences…", 'Application preferences');
-        $fileMenu->AppendSeparator();
-        $fileMenu->Append(wxID_EXIT, "&Quit", 'Quit Slic3r');
-        EVT_MENU($frame, MI_LOAD_CONF, sub { $self->{skeinpanel}->load_config_file });
-        EVT_MENU($frame, MI_LOAD_CONFBUNDLE, sub { $self->{skeinpanel}->load_configbundle });
-        EVT_MENU($frame, MI_EXPORT_CONF, sub { $self->{skeinpanel}->export_config });
-        EVT_MENU($frame, MI_EXPORT_CONFBUNDLE, sub { $self->{skeinpanel}->export_configbundle });
-        EVT_MENU($frame, MI_QUICK_SLICE, sub { $self->{skeinpanel}->quick_slice;
-                                               $repeat->Enable(defined $Slic3r::GUI::SkeinPanel::last_input_file) });
-        EVT_MENU($frame, MI_REPEAT_QUICK, sub { $self->{skeinpanel}->quick_slice(reslice => 1) });
-        EVT_MENU($frame, MI_QUICK_SAVE_AS, sub { $self->{skeinpanel}->quick_slice(save_as => 1);
-                                                 $repeat->Enable(defined $Slic3r::GUI::SkeinPanel::last_input_file) });
-        EVT_MENU($frame, MI_SLICE_SVG, sub { $self->{skeinpanel}->quick_slice(save_as => 1, export_svg => 1) });
-        EVT_MENU($frame, MI_REPAIR_STL, sub { $self->{skeinpanel}->repair_stl });
-        EVT_MENU($frame, MI_COMBINE_STLS, sub { $self->{skeinpanel}->combine_stls });
-        EVT_MENU($frame, wxID_PREFERENCES, sub { Slic3r::GUI::Preferences->new($frame)->ShowModal });
-        EVT_MENU($frame, wxID_EXIT, sub {$_[0]->Close(0)});
-    }
-    
-    # Plater menu
-    my $platerMenu;
-    unless ($no_plater) {
-        $platerMenu = Wx::Menu->new;
-        $platerMenu->Append(MI_PLATER_EXPORT_GCODE, "Export G-code...", 'Export current plate as G-code');
-        $platerMenu->Append(MI_PLATER_EXPORT_STL, "Export STL...", 'Export current plate as STL');
-        $platerMenu->Append(MI_PLATER_EXPORT_AMF, "Export AMF...", 'Export current plate as AMF');
-        EVT_MENU($frame, MI_PLATER_EXPORT_GCODE, sub { $self->{skeinpanel}{plater}->export_gcode });
-        EVT_MENU($frame, MI_PLATER_EXPORT_STL, sub { $self->{skeinpanel}{plater}->export_stl });
-        EVT_MENU($frame, MI_PLATER_EXPORT_AMF, sub { $self->{skeinpanel}{plater}->export_amf });
-    }
-    
-    # Window menu
-    my $windowMenu = Wx::Menu->new;
-    {
-        my $tab_count = $no_plater ? 3 : 4;
-        $windowMenu->Append(MI_TAB_PLATER, "Select &Plater Tab\tCtrl+1", 'Show the plater') unless $no_plater;
-        $windowMenu->Append(MI_TAB_PRINT, "Select P&rint Settings Tab\tCtrl+2", 'Show the print settings');
-        $windowMenu->Append(MI_TAB_FILAMENT, "Select &Filament Settings Tab\tCtrl+3", 'Show the filament settings');
-        $windowMenu->Append(MI_TAB_PRINTER, "Select Print&er Settings Tab\tCtrl+4", 'Show the printer settings');
-        EVT_MENU($frame, MI_TAB_PLATER, sub { $self->{skeinpanel}->select_tab(0) }) unless $no_plater;
-        EVT_MENU($frame, MI_TAB_PRINT, sub { $self->{skeinpanel}->select_tab($tab_count-3) });
-        EVT_MENU($frame, MI_TAB_FILAMENT, sub { $self->{skeinpanel}->select_tab($tab_count-2) });
-        EVT_MENU($frame, MI_TAB_PRINTER, sub { $self->{skeinpanel}->select_tab($tab_count-1) });
-    }
-    
-    # Help menu
-    my $helpMenu = Wx::Menu->new;
-    {
-        $helpMenu->Append(MI_CONF_WIZARD, "&Configuration $Slic3r::GUI::ConfigWizard::wizard…", "Run Configuration $Slic3r::GUI::ConfigWizard::wizard");
-        $helpMenu->AppendSeparator();
-        $helpMenu->Append(MI_WEBSITE, "Slic3r &Website", 'Open the Slic3r website in your browser');
-        my $versioncheck = $helpMenu->Append(MI_VERSIONCHECK, "Check for &Updates...", 'Check for new Slic3r versions');
-        $versioncheck->Enable(Slic3r::GUI->have_version_check);
-        $helpMenu->Append(MI_DOCUMENTATION, "Slic3r &Manual", 'Open the Slic3r manual in your browser');
-        $helpMenu->AppendSeparator();
-        $helpMenu->Append(wxID_ABOUT, "&About Slic3r", 'Show about dialog');
-        EVT_MENU($frame, MI_CONF_WIZARD, sub { $self->{skeinpanel}->config_wizard });
-        EVT_MENU($frame, MI_WEBSITE, sub { Wx::LaunchDefaultBrowser('http://slic3r.org/') });
-        EVT_MENU($frame, MI_VERSIONCHECK, sub { Slic3r::GUI->check_version(manual => 1) });
-        EVT_MENU($frame, MI_DOCUMENTATION, sub { Wx::LaunchDefaultBrowser('http://manual.slic3r.org/') });
-        EVT_MENU($frame, wxID_ABOUT, \&about);
-    }
-    
-    # menubar
-    # assign menubar to frame after appending items, otherwise special items
-    # will not be handled correctly
-    {
-        my $menubar = Wx::MenuBar->new;
-        $menubar->Append($fileMenu, "&File");
-        $menubar->Append($platerMenu, "&Plater") if $platerMenu;
-        $menubar->Append($windowMenu, "&Window");
-        $menubar->Append($helpMenu, "&Help");
-        $frame->SetMenuBar($menubar);
-    }
-    
-    EVT_CLOSE($frame, sub {
-        my (undef, $event) = @_;
-        if ($event->CanVeto && !$self->{skeinpanel}->check_unsaved_changes) {
-            $event->Veto;
-            return;
+        my @dirs = ($FindBin::Bin);
+        if (&Wx::wxMAC) {
+            push @dirs, qw();
+        } elsif (&Wx::wxMSW) {
+            push @dirs, qw();
         }
-        $event->Skip;
-    });
-    
-    $frame->Fit;
-    $frame->SetMinSize($frame->GetSize);
-    $frame->Show;
-    $frame->Layout;
+        my $init_bundle = first { -e $_ } map "$_/.init_bundle.ini", @dirs;
+        if ($init_bundle) {
+            Slic3r::debugf "Loading config bundle from %s\n", $init_bundle;
+            $self->{mainframe}->load_configbundle($init_bundle, 1);
+            $run_wizard = 0;
+        }
+    }
     
     if (!$run_wizard && (!defined $last_version || $last_version ne $Slic3r::VERSION)) {
         # user was running another Slic3r version on this computer
         if (!defined $last_version || $last_version =~ /^0\./) {
-            show_info($self->{skeinpanel}, "Hello! Support material was improved since the "
+            show_info($self->{mainframe}, "Hello! Support material was improved since the "
                 . "last version of Slic3r you used. It is strongly recommended to revert "
                 . "your support material settings to the factory defaults and start from "
                 . "those. Enjoy and provide feedback!", "Support Material");
         }
+        if (!defined $last_version || $last_version =~ /^(?:0|1\.[01])\./) {
+            show_info($self->{mainframe}, "Hello! In this version a new Bed Shape option was "
+                . "added. If the bed coordinates in the plater preview screen look wrong, go "
+                . "to Print Settings and click the \"Set\" button next to \"Bed Shape\".", "Bed Shape");
+        }
     }
-    $self->{skeinpanel}->config_wizard if $run_wizard;
+    $self->{mainframe}->config_wizard if $run_wizard;
     
-    Slic3r::GUI->check_version
-        if Slic3r::GUI->have_version_check
+    $self->check_version
+        if $self->have_version_check
             && ($Settings->{_}{version_check} // 1)
             && (!$Settings->{_}{last_version_check} || (time - $Settings->{_}{last_version_check}) >= 86400);
     
@@ -247,48 +218,68 @@ sub OnInit {
         }
     });
     
+    EVT_COMMAND($self, -1, $VERSION_CHECK_EVENT, sub {
+        my ($self, $event) = @_;
+        my ($success, $response, $manual_check) = @{$event->GetData};
+        
+        if ($success) {
+            if ($response =~ /^obsolete ?= ?([a-z0-9.-]+,)*\Q$Slic3r::VERSION\E(?:,|$)/) {
+                my $res = Wx::MessageDialog->new(undef, "A new version is available. Do you want to open the Slic3r website now?",
+                    'Update', wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxICON_INFORMATION | wxICON_ERROR)->ShowModal;
+                Wx::LaunchDefaultBrowser('http://slic3r.org/') if $res == wxID_YES;
+            } else {
+                Slic3r::GUI::show_info(undef, "You're using the latest version. No updates are available.") if $manual_check;
+            }
+            $Settings->{_}{last_version_check} = time();
+            $self->save_settings;
+        } else {
+            Slic3r::GUI::show_error(undef, "Failed to check for updates. Try later.") if $manual_check;
+        }
+    });
+    
     return 1;
 }
 
 sub about {
-    my $frame = shift;
+    my ($self) = @_;
     
-    my $about = Slic3r::GUI::AboutDialog->new($frame);
+    my $about = Slic3r::GUI::AboutDialog->new(undef);
     $about->ShowModal;
     $about->Destroy;
 }
 
+# static method accepting a wxWindow object as first parameter
 sub catch_error {
     my ($self, $cb, $message_dialog) = @_;
     if (my $err = $@) {
         $cb->() if $cb;
-        my @params = ($err, 'Error', wxOK | wxICON_ERROR);
         $message_dialog
-            ? $message_dialog->(@params)
-            : Wx::MessageDialog->new($self, @params)->ShowModal;
+            ? $message_dialog->($err, 'Error', wxOK | wxICON_ERROR)
+            : Slic3r::GUI::show_error($self, $err);
         return 1;
     }
     return 0;
 }
 
+# static method accepting a wxWindow object as first parameter
 sub show_error {
-    my $self = shift;
-    my ($message) = @_;
-    Wx::MessageDialog->new($self, $message, 'Error', wxOK | wxICON_ERROR)->ShowModal;
+    my ($parent, $message) = @_;
+    Wx::MessageDialog->new($parent, $message, 'Error', wxOK | wxICON_ERROR)->ShowModal;
 }
 
+# static method accepting a wxWindow object as first parameter
 sub show_info {
-    my $self = shift;
-    my ($message, $title) = @_;
-    Wx::MessageDialog->new($self, $message, $title || 'Notice', wxOK | wxICON_INFORMATION)->ShowModal;
+    my ($parent, $message, $title) = @_;
+    Wx::MessageDialog->new($parent, $message, $title || 'Notice', wxOK | wxICON_INFORMATION)->ShowModal;
 }
 
+# static method accepting a wxWindow object as first parameter
 sub fatal_error {
-    my $self = shift;
-    $self->show_error(@_);
+    show_error(@_);
     exit 1;
 }
 
+# static method accepting a wxWindow object as first parameter
 sub warning_catcher {
     my ($self, $message_dialog) = @_;
     return sub {
@@ -302,8 +293,7 @@ sub warning_catcher {
 }
 
 sub notify {
-    my $self = shift;
-    my ($message) = @_;
+    my ($self, $message) = @_;
 
     my $frame = $self->GetTopWindow;
     # try harder to attract user attention on OS X
@@ -314,36 +304,80 @@ sub notify {
 }
 
 sub save_settings {
-    my $class = shift;
-    
+    my ($self) = @_;
     Slic3r::Config->write_ini("$datadir/slic3r.ini", $Settings);
 }
 
-sub presets {
-    my ($class, $section) = @_;
+sub presets { return $_[0]->{presets}; }
+
+sub load_presets {
+    my ($self) = @_;
     
-    my %presets = ();
-    opendir my $dh, "$Slic3r::GUI::datadir/$section" or die "Failed to read directory $Slic3r::GUI::datadir/$section (errno: $!)\n";
-    foreach my $file (grep /\.ini$/i, readdir $dh) {
-        my $name = basename($file);
-        $name =~ s/\.ini$//;
-        $presets{$name} = "$Slic3r::GUI::datadir/$section/$file";
+    for my $group (qw(printer filament print)) {
+        my $presets = $self->{presets}{$group};
+        
+        # keep external or dirty presets
+        @$presets = grep { ($_->external && $_->file_exists) || $_->dirty } @$presets;
+        
+        my $dir = "$Slic3r::GUI::datadir/$group";
+        opendir my $dh, Slic3r::encode_path($dir)
+            or die "Failed to read directory $dir (errno: $!)\n";
+        foreach my $file (grep /\.ini$/i, readdir $dh) {
+            $file = Slic3r::decode_path($file);
+            my $name = basename($file);
+            $name =~ s/\.ini$//i;
+            
+            # skip if we already have it
+            next if any { $_->name eq $name } @$presets;
+            
+            push @$presets, Slic3r::GUI::Preset->new(
+                group   => $group,
+                name    => $name,
+                file    => "$dir/$file",
+            );
+        }
+        closedir $dh;
+    
+        @$presets = sort { $a->name cmp $b->name } @$presets;
+    
+        unshift @$presets, Slic3r::GUI::Preset->new(
+            group   => $group,
+            default => 1,
+            name    => '- default -',
+        );
     }
-    closedir $dh;
+}
+
+sub add_external_preset {
+    my ($self, $file) = @_;
     
-    return %presets;
+    my $name = basename($file);  # keep .ini suffix
+    for my $group (qw(printer filament print)) {
+        my $presets = $self->{presets}{$group};
+        
+        # remove any existing preset with the same name
+        @$presets = grep { $_->name ne $name } @$presets;
+        
+        push @$presets, Slic3r::GUI::Preset->new(
+            group    => $group,
+            name     => $name,
+            file     => $file,
+            external => 1,
+        );
+    }
+    return $name;
 }
 
 sub have_version_check {
-    my $class = shift;
+    my ($self) = @_;
     
     # return an explicit 0
-    return ($Slic3r::have_threads && $Slic3r::build && eval "use LWP::UserAgent; 1") || 0;
+    return ($Slic3r::have_threads && $Slic3r::VERSION !~ /-dev$/ && $have_LWP) || 0;
 }
 
 sub check_version {
-    my $class = shift;
-    my %p = @_;
+    my ($self, $manual_check) = @_;
+    
     Slic3r::debugf "Checking for updates...\n";
     
     @_ = ();
@@ -351,26 +385,15 @@ sub check_version {
         my $ua = LWP::UserAgent->new;
         $ua->timeout(10);
         my $response = $ua->get('http://slic3r.org/updatecheck');
-        if ($response->is_success) {
-            if ($response->decoded_content =~ /^obsolete ?= ?([a-z0-9.-]+,)*\Q$Slic3r::VERSION\E(?:,|$)/) {
-                my $res = Wx::MessageDialog->new(undef, "A new version is available. Do you want to open the Slic3r website now?",
-                    'Update', wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxICON_INFORMATION | wxICON_ERROR)->ShowModal;
-                Wx::LaunchDefaultBrowser('http://slic3r.org/') if $res == wxID_YES;
-            } else {
-                Slic3r::GUI::show_info(undef, "You're using the latest version. No updates are available.") if $p{manual};
-            }
-            $Settings->{_}{last_version_check} = time();
-            Slic3r::GUI->save_settings;
-        } else {
-            Slic3r::GUI::show_error(undef, "Failed to check for updates. Try later.") if $p{manual};
-        }
+        Wx::PostEvent($self, Wx::PlThreadEvent->new(-1, $VERSION_CHECK_EVENT,
+            threads::shared::shared_clone([ $response->is_success, $response->decoded_content, $manual_check ])));
+        
         Slic3r::thread_cleanup();
     })->detach;
 }
 
 sub output_path {
-    my $class = shift;
-    my ($dir) = @_;
+    my ($self, $dir) = @_;
     
     return ($Settings->{_}{last_output_path} && $Settings->{_}{remember_output_path})
         ? $Settings->{_}{last_output_path}
@@ -378,207 +401,109 @@ sub output_path {
 }
 
 sub open_model {
-    my ($self) = @_;
+    my ($self, $window) = @_;
     
     my $dir = $Slic3r::GUI::Settings->{recent}{skein_directory}
            || $Slic3r::GUI::Settings->{recent}{config_directory}
            || '';
     
-    my $dialog = Wx::FileDialog->new($self, 'Choose one or more files (STL/OBJ/AMF):', $dir, "",
-        &Slic3r::GUI::SkeinPanel::MODEL_WILDCARD, wxFD_OPEN | wxFD_MULTIPLE | wxFD_FILE_MUST_EXIST);
+    my $dialog = Wx::FileDialog->new($window // $self->GetTopWindow, 'Choose one or more files (STL/OBJ/AMF/3MF):', $dir, "",
+        MODEL_WILDCARD, wxFD_OPEN | wxFD_MULTIPLE | wxFD_FILE_MUST_EXIST);
     if ($dialog->ShowModal != wxID_OK) {
         $dialog->Destroy;
         return;
     }
-    my @input_files = $dialog->GetPaths;
+    my @input_files = map Slic3r::decode_path($_), $dialog->GetPaths;
     $dialog->Destroy;
     
     return @input_files;
 }
 
 sub CallAfter {
-    my $class = shift;
-    my ($cb) = @_;
+    my ($self, $cb) = @_;
     push @cb, $cb;
 }
 
-package Slic3r::GUI::ProgressStatusBar;
-use Wx qw(:gauge :misc);
-use base 'Wx::StatusBar';
-
-sub new {
-    my $class = shift;
-    my $self = $class->SUPER::new(@_);
+sub scan_serial_ports {
+    my ($self) = @_;
     
-    $self->{busy} = 0;
-    $self->{timer} = Wx::Timer->new($self);
-    $self->{prog} = Wx::Gauge->new($self, wxGA_HORIZONTAL, 100, wxDefaultPosition, wxDefaultSize);
-    $self->{prog}->Hide;
-    $self->{cancelbutton} = Wx::Button->new($self, -1, "Cancel", wxDefaultPosition, wxDefaultSize);
-    $self->{cancelbutton}->Hide;
+    my @ports = ();
     
-    $self->SetFieldsCount(3);
-    $self->SetStatusWidths(-1, 150, 155);
-    
-    Wx::Event::EVT_TIMER($self, \&OnTimer, $self->{timer});
-    Wx::Event::EVT_SIZE($self, \&OnSize);
-    Wx::Event::EVT_BUTTON($self, $self->{cancelbutton}, sub {
-        $self->{cancel_cb}->();
-        $self->{cancelbutton}->Hide;
-    });
-    
-    return $self;
-}
-
-sub DESTROY {
-    my $self = shift;    
-    $self->{timer}->Stop if $self->{timer} && $self->{timer}->IsRunning;
-}
-
-sub OnSize {
-    my ($self, $event) = @_;
-    
-    my %fields = (
-        # 0 is reserved for status text
-        1 => $self->{cancelbutton},
-        2 => $self->{prog},
-    );
-
-    foreach (keys %fields) {
-        my $rect = $self->GetFieldRect($_);
-        my $offset = &Wx::wxGTK ? 1 : 0; # add a cosmetic 1 pixel offset on wxGTK
-        my $pos = [$rect->GetX + $offset, $rect->GetY + $offset];
-        $fields{$_}->Move($pos);
-        $fields{$_}->SetSize($rect->GetWidth - $offset, $rect->GetHeight);
-    }
-
-    $event->Skip;
-}
-
-sub OnTimer {
-    my ($self, $event) = @_;
-    
-    if ($self->{prog}->IsShown) {
-        $self->{timer}->Stop;
-    }
-    $self->{prog}->Pulse if $self->{_busy};
-}
-
-sub SetCancelCallback {
-    my $self = shift;
-    my ($cb) = @_;
-    $self->{cancel_cb} = $cb;
-    $cb ? $self->{cancelbutton}->Show : $self->{cancelbutton}->Hide;
-}
-
-sub Run {
-    my $self = shift;
-    my $rate = shift || 100;
-    if (!$self->{timer}->IsRunning) {
-        $self->{timer}->Start($rate);
-    }
-}
-
-sub GetProgress {
-    my $self = shift;
-    return $self->{prog}->GetValue;
-}
-
-sub SetProgress {
-    my $self = shift;
-    my ($val) = @_;
-    if (!$self->{prog}->IsShown) {
-        $self->ShowProgress(1);
-    }
-    if ($val == $self->{prog}->GetRange) {
-        $self->{prog}->SetValue(0);
-        $self->ShowProgress(0);
+    if ($^O eq 'MSWin32') {
+        # Windows
+        if (eval "use Win32::TieRegistry; 1") {
+            my $ts = Win32::TieRegistry->new("HKEY_LOCAL_MACHINE\\HARDWARE\\DEVICEMAP\\SERIALCOMM",
+                { Access => 'KEY_READ' });
+            if ($ts) {
+                # when no serial ports are available, the registry key doesn't exist and 
+                # TieRegistry->new returns undef
+                $ts->Tie(\my %reg);
+                push @ports, sort values %reg;
+            }
+        }
     } else {
-        $self->{prog}->SetValue($val);
+        # UNIX and OS X
+        push @ports, glob '/dev/{ttyUSB,ttyACM,tty.,cu.,rfcomm}*';
+    }
+    
+    return grep !/Bluetooth|FireFly/, @ports;
+}
+
+sub append_menu_item {
+    my ($self, $menu, $string, $description, $cb, $id, $icon, $kind) = @_;
+    
+    $id //= &Wx::NewId();
+    my $item = Wx::MenuItem->new($menu, $id, $string, $description // '', $kind // 0);
+    $self->set_menu_item_icon($item, $icon);
+    $menu->Append($item);
+    
+    EVT_MENU($self, $id, $cb);
+    return $item;
+}
+
+sub append_submenu {
+    my ($self, $menu, $string, $description, $submenu, $id, $icon) = @_;
+    
+    $id //= &Wx::NewId();
+    my $item = Wx::MenuItem->new($menu, $id, $string, $description // '');
+    $self->set_menu_item_icon($item, $icon);
+    $item->SetSubMenu($submenu);
+    $menu->Append($item);
+    
+    return $item;
+}
+
+sub set_menu_item_icon {
+    my ($self, $menuItem, $icon) = @_;
+    
+    # SetBitmap was not available on OS X before Wx 0.9927
+    if ($icon && $menuItem->can('SetBitmap')) {
+        $menuItem->SetBitmap(Wx::Bitmap->new($Slic3r::var->($icon), wxBITMAP_TYPE_PNG));
     }
 }
 
-sub SetRange {
-    my $self = shift;
-    my ($val) = @_;
+sub save_window_pos {
+    my ($self, $window, $name) = @_;
     
-    if ($val != $self->{prog}->GetRange) {
-        $self->{prog}->SetRange($val);
-    }
+    $Settings->{_}{"${name}_pos"}  = join ',', $window->GetScreenPositionXY;
+    $Settings->{_}{"${name}_size"} = join ',', $window->GetSizeWH;
+    $Settings->{_}{"${name}_maximized"}      = $window->IsMaximized;
+    $self->save_settings;
 }
 
-sub ShowProgress {
-    my $self = shift;
-    my ($show) = @_;
+sub restore_window_pos {
+    my ($self, $window, $name) = @_;
     
-    $self->{prog}->Show($show);
-    $self->{prog}->Pulse;
-}
-
-sub StartBusy {
-    my $self = shift;
-    my $rate = shift || 100;
-    
-    $self->{_busy} = 1;
-    $self->ShowProgress(1);
-    if (!$self->{timer}->IsRunning) {
-        $self->{timer}->Start($rate);
-    }
-}
-
-sub StopBusy {
-    my $self = shift;
-    
-    $self->{timer}->Stop;
-    $self->ShowProgress(0);
-    $self->{prog}->SetValue(0);
-    $self->{_busy} = 0;
-}
-
-sub IsBusy {
-    my $self = shift;
-    return $self->{_busy};
-}
-
-package Slic3r::GUI::Notifier;
-
-sub new {
-    my $class = shift;
-    my $self;
-
-    $self->{icon} = "$Slic3r::var/Slic3r.png";
-
-    if (eval 'use Growl::GNTP; 1') {
-        # register with growl
-        eval {
-            $self->{growler} = Growl::GNTP->new(AppName => 'Slic3r', AppIcon => $self->{icon});
-            $self->{growler}->register([{Name => 'SKEIN_DONE', DisplayName => 'Slicing Done'}]);
-        };
-    }
-
-    bless $self, $class;
-
-    return $self;
-}
-
-sub notify {
-    my ($self, $message) = @_;
-    my $title = 'Slicing Done!';
-
-    eval {
-        $self->{growler}->notify(Event => 'SKEIN_DONE', Title => $title, Message => $message)
-            if $self->{growler};
-    };
-    # Net::DBus is broken in multithreaded environment
-    if (0 && eval 'use Net::DBus; 1') {
-        eval {
-            my $session = Net::DBus->session;
-            my $serv = $session->get_service('org.freedesktop.Notifications');
-            my $notifier = $serv->get_object('/org/freedesktop/Notifications',
-                                             'org.freedesktop.Notifications');
-            $notifier->Notify('Slic3r', 0, $self->{icon}, $title, $message, [], {}, -1);
-            undef $Net::DBus::bus_session;
-        };
+    if (defined $Settings->{_}{"${name}_pos"}) {
+        my $size = [ split ',', $Settings->{_}{"${name}_size"}, 2 ];
+        $window->SetSize($size);
+        
+        my $display = Wx::Display->new->GetClientArea();
+        my $pos = [ split ',', $Settings->{_}{"${name}_pos"}, 2 ];
+        if (($pos->[X] + $size->[X]/2) < $display->GetRight && ($pos->[Y] + $size->[Y]/2) < $display->GetBottom) {
+            $window->Move($pos);
+        }
+        $window->Maximize(1) if $Settings->{_}{"${name}_maximized"};
     }
 }
 

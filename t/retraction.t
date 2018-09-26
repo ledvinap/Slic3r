@@ -1,13 +1,16 @@
-use Test::More tests => 17;
+use Test::More tests => 27;
 use strict;
 use warnings;
 
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
+use List::Util qw(any);
 use Slic3r;
+use Slic3r::Geometry qw(epsilon);
 use Slic3r::Test qw(_eq);
 
 {
@@ -17,7 +20,7 @@ use Slic3r::Test qw(_eq);
     my $test = sub {
         my ($conf) = @_;
         $conf ||= $config;
-    
+        
         my $print = Slic3r::Test::init_print('20mm_cube', config => $conf, duplicate => $duplicate);
     
         my $tool = 0;
@@ -25,6 +28,7 @@ use Slic3r::Test qw(_eq);
         my @retracted = (1);  # ignore the first travel move from home to first point
         my @retracted_length = (0);
         my $lifted = 0;
+        my $lift_dist = 0; # track lifted distance for toolchanges and extruders with different retract_lift values
         my $changed_tool = 0;
         my $wait_for_toolchange = 0;
         Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
@@ -42,17 +46,19 @@ use Slic3r::Test qw(_eq);
         
             if ($info->{dist_Z}) {
                 # lift move or lift + change layer
-                if (_eq($info->{dist_Z}, $print->config->get_at('retract_lift', $tool))
-                    || (_eq($info->{dist_Z}, $conf->layer_height + $print->config->get_at('retract_lift', $tool)) && $print->config->get_at('retract_lift', $tool) > 0)) {
-                    fail 'only lifting while retracted' if !$retracted[$tool] && !($conf->g0 && $info->{retracting});
+                if (_eq($info->{dist_Z}, $print->print->config->get_at('retract_lift', $tool))
+                    || (_eq($info->{dist_Z}, $conf->layer_height + $print->print->config->get_at('retract_lift', $tool)) && $print->print->config->get_at('retract_lift', $tool) > 0)) {
+                    fail 'only lifting while retracted' if !$retracted[$tool];
                     fail 'double lift' if $lifted;
                     $lifted = 1;
+                    $lift_dist = $info->{dist_Z};
                 }
                 if ($info->{dist_Z} < 0) {
                     fail 'going down only after lifting' if !$lifted;
                     fail 'going down by the same amount of the lift or by the amount needed to get to next layer'
-                        if !_eq($info->{dist_Z}, -$print->config->get_at('retract_lift', $tool))
-                            && !_eq($info->{dist_Z}, -$print->config->get_at('retract_lift', $tool) + $conf->layer_height);
+                        if !_eq($info->{dist_Z}, -$lift_dist)
+                            && !_eq($info->{dist_Z}, -lift_dist + $conf->layer_height);
+                    $lift_dist = 0;
                     $lifted = 0;
                 }
                 fail 'move Z at travel speed' if ($args->{F} // $self->F) != $conf->travel_speed * 60;
@@ -60,31 +66,29 @@ use Slic3r::Test qw(_eq);
             if ($info->{retracting}) {
                 $retracted[$tool] = 1;
                 $retracted_length[$tool] += -$info->{dist_E};
-                if (_eq($retracted_length[$tool], $print->config->get_at('retract_length', $tool))) {
+                if (_eq($retracted_length[$tool], $print->print->config->get_at('retract_length', $tool))) {
                     # okay
-                } elsif (_eq($retracted_length[$tool], $print->config->get_at('retract_length_toolchange', $tool))) {
+                } elsif (_eq($retracted_length[$tool], $print->print->config->get_at('retract_length_toolchange', $tool))) {
                     $wait_for_toolchange = 1;
                 } else {
                     fail 'retracted by the correct amount';
                 }
-                fail 'combining retraction and travel with G0'
-                    if $cmd ne 'G0' && $conf->g0 && ($info->{dist_Z} || $info->{dist_XY});
             }
             if ($info->{extruding}) {
                 fail 'only extruding while not lifted' if $lifted;
                 if ($retracted[$tool]) {
-                    my $expected_amount = $retracted_length[$tool] + $print->config->get_at('retract_restart_extra', $tool);
+                    my $expected_amount = $retracted_length[$tool] + $print->print->config->get_at('retract_restart_extra', $tool);
                     if ($changed_tool && $toolchange_count[$tool] > 1) {
-                        $expected_amount = $print->config->get_at('retract_length_toolchange', $tool) + $print->config->get_at('retract_restart_extra_toolchange', $tool);
+                        $expected_amount = $print->print->config->get_at('retract_length_toolchange', $tool) + $print->print->config->get_at('retract_restart_extra_toolchange', $tool);
                         $changed_tool = 0;
                     }
-                    fail 'unretracted by the correct amount'
+                    fail 'unretracted by the correct amount' && exit
                         if !_eq($info->{dist_E}, $expected_amount);
                     $retracted[$tool] = 0;
                     $retracted_length[$tool] = 0;
                 }
             }
-            if ($info->{travel} && $info->{dist_XY} >= $print->config->get_at('retract_before_travel', $tool)) {
+            if ($info->{travel} && $info->{dist_XY} >= $print->print->config->get_at('retract_before_travel', $tool)) {
                 fail 'retracted before long travel move' if !$retracted[$tool];
             }
         });
@@ -111,7 +115,7 @@ use Slic3r::Test qw(_eq);
         $conf->set('retract_restart_extra',   [-1]);
         ok $test->($conf), "negative restart extra length$descr";
     
-        $conf->set('retract_lift',            [1]);
+        $conf->set('retract_lift',            [1, 2]);
         ok $test->($conf), "lift$descr";
     };
 
@@ -120,11 +124,7 @@ use Slic3r::Test qw(_eq);
     $duplicate = 2;
     $retract_tests->(' (duplicate)');
 
-    $config->set('g0', 1);
-    $retract_tests->(' (G0 and duplicate)');
-
     $duplicate = 1;
-    $config->set('g0', 0);
     $config->set('infill_extruder', 2);
     $config->set('skirts', 4);
     $config->set('skirt_height', 3);
@@ -133,16 +133,21 @@ use Slic3r::Test qw(_eq);
 
 {
     my $config = Slic3r::Config->new_from_defaults;
+    $config->set('start_gcode', '');  # prevent any default priming Z move from affecting our lift detection
+    $config->set('retract_length', [0]);
     $config->set('retract_layer_change', [0]);
+    $config->set('retract_lift', [0.2]);
     
     my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
     my $retracted = 0;
     my $layer_changes_with_retraction = 0;
+    my $retractions = my $z_restores = 0;
     Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
         my ($self, $cmd, $args, $info) = @_;
         
         if ($info->{retracting}) {
             $retracted = 1;
+            $retractions++;
         } elsif ($info->{extruding} && $retracted) {
             $retracted = 0;
         }
@@ -150,9 +155,156 @@ use Slic3r::Test qw(_eq);
         if ($info->{dist_Z} && $retracted) {
             $layer_changes_with_retraction++;
         }
+        if ($info->{dist_Z} && $args->{Z} < $self->Z) {
+            $z_restores++;
+        }
     });
     
     is $layer_changes_with_retraction, 0, 'no retraction on layer change';
+    is $retractions, 0, 'no retractions';
+    is $z_restores, 0, 'no lift';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('use_firmware_retraction', 1);
+    
+    my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
+    my $retracted = 0;
+    my $double_retractions = my $double_unretractions = 0;
+    Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
+        my ($self, $cmd, $args, $info) = @_;
+        
+        if ($cmd eq 'G10') {
+            $double_retractions++ if $retracted;
+            $retracted = 1;
+        } elsif ($cmd eq 'G11') {
+            $double_unretractions++ if !$retracted;
+            $retracted = 0;
+        }
+    });
+    
+    is $double_retractions, 0, 'no double retractions';
+    is $double_unretractions, 0, 'no double unretractions';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('use_firmware_retraction', 1);
+    $config->set('retract_length', [0]);
+    
+    my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
+    my $retracted = 0;
+    Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
+        my ($self, $cmd, $args, $info) = @_;
+        
+        if ($cmd eq 'G10') {
+            $retracted = 1;
+        }
+    });
+    
+    ok $retracted, 'retracting also when --retract-length is 0 but --use-firmware-retraction is enabled';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('start_gcode', '');
+    $config->set('retract_lift', [3, 4]);
+    $config->set('only_retract_when_crossing_perimeters', 0);
+    
+    my @lifted_at = ();
+    my $test = sub {
+        my $print = Slic3r::Test::init_print('20mm_cube', config => $config, duplicate => 2);
+        @lifted_at = ();
+        my $retracted = 0;
+        my $lifted = 0;
+        my $tool = 0;
+        Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
+            my ($self, $cmd, $args, $info) = @_;
+        
+            if ($cmd eq 'G1') {
+                if ($info->{dist_Z} < 0) {
+                    # going downwards; this is a "restore lift" move
+                    $lifted = 0;
+                    push @lifted_at, $info->{new_Z};
+                } elsif (abs($info->{dist_Z} - $config->get_at('retract_lift', $tool)) < &epsilon) {
+                    # going upwards by a large amount; this is a lift move
+                    fail 'always lift after retraction' if !$retracted;
+                    ### It would be useful to prevent the double lift happening at layer change:
+                    ###fail 'no double lift' if $lifted;
+                    $lifted = 1;
+                } elsif ($info->{retracting}) {
+                    $retracted = 1;
+                } elsif ($info->{extruding} && $info->{dist_XY} == 0) {
+                    # consider the lift as layer change if they are configured with the same distance
+                    $lifted = 0 if $config->get_at('retract_lift', $tool) == $config->layer_height;
+                    fail 'always unretract after unlifting' if $lifted;
+                    $retracted = 0;
+                } elsif ($info->{travel} && $info->{dist_XY} >= $config->get_at('retract_before_travel', $tool)) {
+                    #printf "dist_XY = %f, rbt = %f\n", $info->{dist_XY}, $config->get_at('retract_before_travel', 0);
+                    my $below = $config->get_at('retract_lift_below', $tool);
+                    fail 'no retraction for long travel move' if !$retracted;
+                    fail 'no lift for long travel move'
+                        if !$lifted
+                            && $self->Z >= $config->get_at('retract_lift_above', $tool)
+                            && ($below == 0 || $self->Z <= $below);
+                }
+            } elsif ($cmd =~ /^T(\d+)/) {
+                $tool = $1;
+            }
+        });
+    };
+    
+    $config->set('retract_layer_change', [1,1]);
+    $test->();
+    ok !!@lifted_at, 'lift is compatible with retract_layer_change';
+    
+    $config->set('retract_lift_above', [0, 0]);
+    $config->set('retract_lift_below', [0, 0]);
+    $test->();
+    ok !!@lifted_at, 'lift takes place when above/below == 0';
+    
+    $config->set('retract_lift_above', [5, 6]);
+    $config->set('retract_lift_below', [15, 13]);
+    $test->();
+    ok !!@lifted_at, 'lift takes place when above/below != 0';
+    ok !(any { $_ < $config->get_at('retract_lift_above', 0) } @lifted_at),
+        'Z is not lifted below the configured value';
+    {
+        my $below = $config->get_at('retract_lift_below', 0);
+        $below += $config->layer_height if $config->get_at('retract_layer_change', 0);
+        ok !(any { $_ > $below } @lifted_at),
+            'Z is not lifted above the configured value';
+    }
+    
+    # check lifting with different values for 2. extruder
+    $config->set('perimeter_extruder', 2);
+    $config->set('infill_extruder', 2);
+    $config->set('retract_lift_above', [0, 0]);
+    $config->set('retract_lift_below', [0, 0]);
+    $test->();
+    ok !!@lifted_at, 'lift takes place when above/below == 0  for 2. extruder';
+    
+    $config->set('retract_lift_above', [5, 6]);
+    $config->set('retract_lift_below', [15, 13]);
+    $test->();
+    ok !!@lifted_at, 'lift takes place when above/below != 0 for 2. extruder';
+    ok !(any { $_ < $config->get_at('retract_lift_above', 1) } @lifted_at),
+        'Z is not lifted below the configured value for 2. extruder';
+    {
+        my $below = $config->get_at('retract_lift_below', 1);
+        $below += $config->layer_height if $config->get_at('retract_layer_change', 1);
+        ok !(any { $_ > $below } @lifted_at),
+            'Z is not lifted above the configured value for 2. extruder';
+    }
+    
+    $config->set('retract_lift', [$config->layer_height]);
+    $config->set('perimeter_extruder', 1);
+    $config->set('infill_extruder', 1);
+    $config->set('retract_lift_above', [0, 0]);
+    $config->set('retract_lift_below', [0, 0]);
+    $test->();
+    
 }
 
 __END__

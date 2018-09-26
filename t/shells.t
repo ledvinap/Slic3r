@@ -1,15 +1,17 @@
-use Test::More tests => 10;
+use Test::More tests => 24;
 use strict;
 use warnings;
 
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
 use List::Util qw(first sum);
 use Slic3r;
 use Slic3r::Geometry qw(epsilon);
+use Slic3r::Surface qw(S_TYPE_TOP);
 use Slic3r::Test;
 
 {
@@ -72,6 +74,9 @@ use Slic3r::Test;
     $config->set('bottom_solid_layers', 0);
     ok $test->(), "no shells are applied when both top and bottom are set to zero";
     
+    $config->set('perimeters', 1);
+    $config->set('top_solid_layers', 3);
+    $config->set('bottom_solid_layers', 3);
     $config->set('fill_density', 0);
     ok $test->(), "proper number of shells is applied even when fill density is none";
 }
@@ -143,6 +148,7 @@ use Slic3r::Test;
     $config->set('top_solid_layers', 3);
     $config->set('solid_infill_speed', 99);
     $config->set('top_solid_infill_speed', 99);
+    $config->set('bridge_speed', 99);
     
     my $print = Slic3r::Test::init_print('sloping_hole', config => $config);
     my %solid_layers = ();  # Z => 1
@@ -165,6 +171,8 @@ use Slic3r::Test;
     $config->set('skirts', 0);
     $config->set('first_layer_height', '100%');
     $config->set('start_gcode', '');
+    $config->set('temperature', [200]);
+    $config->set('first_layer_temperature', [205]);
     
     # TODO: this needs to be tested with a model with sloping edges, where starting
     # points of each layer are not aligned - in that case we would test that no
@@ -175,8 +183,10 @@ use Slic3r::Test;
         my $print = Slic3r::Test::init_print($model_name, config => $config);
         my $travel_moves_after_first_extrusion = 0;
         my $started_extruding = 0;
+        my $first_layer_temperature_set = 0;
+        my $temperature_set = 0;
         my @z_steps = ();
-        Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
+        Slic3r::GCode::Reader->new(Z => $config->z_offset)->parse(Slic3r::Test::gcode($print), sub {
             my ($self, $cmd, $args, $info) = @_;
             
             if ($cmd eq 'G1') {
@@ -184,9 +194,15 @@ use Slic3r::Test;
                 push @z_steps, $info->{dist_Z}
                     if $started_extruding && $info->{dist_Z} > 0;
                 $travel_moves_after_first_extrusion++
-                    if $info->{travel} && $started_extruding && !exists $args->{Z};
+                    if $info->{travel} && $info->{dist_XY} > 0 && $started_extruding && !exists $args->{Z};
+            } elsif ($cmd eq 'M104') {
+                $first_layer_temperature_set = 1 if $args->{S} == 205;
+                $temperature_set = 1 if $args->{S} == 200;
             }
         });
+        
+        ok $first_layer_temperature_set, 'first layer temperature is preserved';
+        ok $temperature_set, 'temperature is preserved';
         
         # we allow one travel move after first extrusion: i.e. when moving to the first
         # spiral point after moving to second layer (bottom layer had loop clipping, so
@@ -208,11 +224,16 @@ use Slic3r::Test;
 {
     my $config = Slic3r::Config->new_from_defaults;
     $config->set('spiral_vase', 1);
+    $config->set('perimeters', 1);
+    $config->set('fill_density', 0);
+    $config->set('top_solid_layers', 0);
     $config->set('bottom_solid_layers', 0);
+    $config->set('retract_layer_change', [0]);
     $config->set('skirts', 0);
     $config->set('first_layer_height', '100%');
     $config->set('layer_height', 0.4);
     $config->set('start_gcode', '');
+    $config->validate;
     
     my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
     my $z_moves = 0;
@@ -224,6 +245,7 @@ use Slic3r::Test;
     my $sum_of_partial_z_equals_to_layer_height = 0;
     my $all_layer_segments_have_same_slope = 0;
     my $horizontal_extrusions = 0;
+    
     Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
         my ($self, $cmd, $args, $info) = @_;
         
@@ -247,11 +269,11 @@ use Slic3r::Test;
                 my $total_dist_XY = sum(map $_->[1], @this_layer);
                 $sum_of_partial_z_equals_to_layer_height = 1
                     if abs(sum(map $_->[0], @this_layer) - $config->layer_height) > epsilon;
-                exit if $sum_of_partial_z_equals_to_layer_height;
+                
                 foreach my $segment (@this_layer) {
                     # check that segment's dist_Z is proportioned to its dist_XY
                     $all_layer_segments_have_same_slope = 1
-                        if abs($segment->[0]*$total_dist_XY/$config->layer_height - $segment->[1]) > epsilon;
+                        if abs($segment->[0]*$total_dist_XY/$config->layer_height - $segment->[1]) > 0.2;
                 }
                 
                 @this_layer = ();
@@ -268,6 +290,52 @@ use Slic3r::Test;
     ok !$sum_of_partial_z_equals_to_layer_height, 'sum of partial Z increments equals to a full layer height';
     ok !$all_layer_segments_have_same_slope, 'all layer segments have the same slope';
     ok !$horizontal_extrusions, 'no horizontal extrusions';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('perimeters', 1);
+    $config->set('fill_density', 0);
+    $config->set('top_solid_layers', 0);
+    $config->set('spiral_vase', 1);
+    $config->set('bottom_solid_layers', 0);
+    $config->set('skirts', 0);
+    $config->set('first_layer_height', '100%');
+    $config->set('start_gcode', '');
+    
+    my $print = Slic3r::Test::init_print('two_hollow_squares', config => $config);
+    my $diagonal_moves = 0;
+    Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
+        my ($self, $cmd, $args, $info) = @_;
+        
+        if ($cmd eq 'G1') {
+            if ($info->{extruding} && $info->{dist_XY} > 0) {
+                if ($info->{dist_Z} > 0) {
+                    $diagonal_moves++;
+                }
+            }
+        }
+    });
+    is $diagonal_moves, 0, 'no spiral moves on two-island object';
+}
+
+{
+    # GH: #3732
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('perimeters', 2);
+    $config->set('extrusion_width', 0.55);
+    $config->set('first_layer_height', 0.25);
+    $config->set('infill_overlap', '50%');
+    $config->set('layer_height', 0.25);
+    $config->set('perimeters', 2);
+    $config->set('extra_perimeters', 1);
+    
+    my $tprint = Slic3r::Test::init_print('step', config => $config);
+    $tprint->print->process;
+    my $layerm19 = $tprint->print->get_object(0)->get_layer(19)->get_region(0);
+    is scalar(@{$layerm19->slices->filter_by_type(S_TYPE_TOP)}), 1, 'top slice detected';
+    is scalar(@{$layerm19->fill_surfaces->filter_by_type(S_TYPE_TOP)}), 0, 'no top fill_surface detected';
+    is $layerm19->perimeters->items_count, 3, 'extra perimeter detected';
 }
 
 __END__

@@ -7,24 +7,31 @@ use Config;
 use File::Spec;
 
 my %prereqs = qw(
-    Encode::Locale                  0
+    Devel::CheckLib                 0
+    Encode                          0
+    Encode::Locale                  1.05
+    ExtUtils::CppGuess              0
     ExtUtils::MakeMaker             6.80
-    ExtUtils::ParseXS               3.22
+    ExtUtils::ParseXS               3.35
     File::Basename                  0
     File::Spec                      0
     Getopt::Long                    0
-    Math::PlanePath                 53
     Module::Build::WithXSpp         0.14
     Moo                             1.003001
+    POSIX                           0
     Scalar::Util                    0
-    Test::Harness                   0
     Test::More                      0
+    Thread::Semaphore               0
     IO::Scalar                      0
+    threads                         1.96
     Time::HiRes                     0
+    Unicode::Normalize              0
 );
 my %recommends = qw(
     Class::XSAccessor               0
-    XML::SAX::ExpatXS               0
+    Test::Harness                   0
+    Thread::Queue                   0
+    threads::shared                 0
 );
 
 my $sudo    = grep { $_ eq '--sudo' } @ARGV;
@@ -32,13 +39,23 @@ my $gui     = grep { $_ eq '--gui' } @ARGV;
 my $xs_only = grep { $_ eq '--xs' }  @ARGV;
 if ($gui) {
     %prereqs = qw(
+    Class::Accessor                 0
     Wx                              0.9918
+    Socket                          2.016
     );
     %recommends = qw(
     Growl::GNTP                     0.15
     Wx::GLCanvas                    0
     OpenGL                          0
+    LWP::UserAgent                  0
+    Net::Bonjour                    0
     );
+    if ($^O eq 'MSWin32') {
+        $recommends{"Win32::TieRegistry"} = 0;
+        
+        # we need an up-to-date Win32::API because older aren't thread-safe (GH #2517)
+        $prereqs{'Win32::API'} = 0.79;
+    }
 } elsif ($xs_only) {
     %prereqs = %recommends = ();
 }
@@ -92,28 +109,29 @@ EOF
         if !$cpanm;
     my @cpanm_args = ();
     push @cpanm_args, "--sudo" if $sudo;
-
+    
+    # install local::lib without --local-lib otherwise it's not usable afterwards
+    if (!eval "use local::lib qw(local-lib); 1") {
+        my $res = system $cpanm, @cpanm_args, 'local::lib';
+        warn "Warning: local::lib is required. You might need to run the `cpanm --sudo local::lib` command in order to install it.\n"
+            if $res != 0;
+    }
+    
+    push @cpanm_args, ('--local-lib', 'local-lib');
+    
     # make sure our cpanm is updated (old ones don't support the ~ syntax)
     system $cpanm, @cpanm_args, 'App::cpanminus';
-    
-    # install the Windows-compatible Math::Libm
-    if ($^O eq 'MSWin32' && !eval "use Math::Libm; 1") {
-        system $cpanm, @cpanm_args, 'https://github.com/alexrj/Math-Libm/tarball/master';
-    }
     
     my %modules = (%prereqs, %recommends);
     foreach my $module (sort keys %modules) {
         my $version = $modules{$module};
-        my @cmd = ($cpanm, @cpanm_args, "$module~$version");
-        if ($module eq 'XML::SAX::ExpatXS' && $^O eq 'MSWin32') {
-            my $mingw = 'C:\dev\CitrusPerl\mingw64';
-            $mingw = 'C:\dev\CitrusPerl\mingw32' if !-d $mingw;
-            if (!-d $mingw) {
-                print "Could not find the MinGW directory at $mingw; skipping XML::SAX::ExpatXS (only needed for faster parsing of AMF files)\n";
-            } else {
-                push @cmd, sprintf('--configure-args="EXPATLIBPATH=%s\lib EXPATINCPATH=%s\include"', $mingw, $mingw);
-            }
-        }
+        my @cmd = ($cpanm, @cpanm_args);
+        
+        # temporary workaround for upstream bug in test
+        push @cmd, '--notest'
+            if $module =~ /^(?:OpenGL|Math::PlanePath|Test::Harness|IO::Scalar)$/;
+        
+        push @cmd, "$module~$version";
         my $res = system @cmd;
         if ($res != 0) {
             if (exists $prereqs{$module}) {
@@ -134,7 +152,7 @@ EOF
                 system './xs/Build', 'distclean';
             }
         }
-        my $res = system $cpanm, @cpanm_args, '--reinstall', './xs';
+        my $res = system $cpanm, @cpanm_args, '--reinstall', '--verbose', './xs';
         if ($res != 0) {
             die "The XS/C++ code failed to compile, aborting\n";
         }

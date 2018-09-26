@@ -2,16 +2,28 @@ use Test::More;
 use strict;
 use warnings;
 
-plan tests => 28;
+plan tests => 44;
 
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
 use Slic3r;
 use Slic3r::Geometry qw(PI polygon_is_convex
     chained_path_from epsilon scale);
+
+{
+    # this test was failing on Windows (GH #1950)
+    my $polygon = Slic3r::Polygon->new(
+        [207802834,-57084522],[196528149,-37556190],[173626821,-25420928],[171285751,-21366123],
+        [118673592,-21366123],[116332562,-25420928],[93431208,-37556191],[82156517,-57084523],
+        [129714478,-84542120],[160244873,-84542120],
+    );
+    my $point = Slic3r::Point->new(95706562, -57294774);
+    ok $polygon->contains_point($point), 'contains_point';
+}
 
 #==========================================================
 
@@ -171,10 +183,85 @@ my $polygons = [
 {
     my $line = Slic3r::Line->new([0, 0], [20, 0]);
     is +Slic3r::Point->new(10, 10)->distance_to_line($line), 10, 'distance_to';
-    is +Slic3r::Point->new(50, 10)->distance_to_line($line), 10, 'distance_to';
+    is +Slic3r::Point->new(50, 0)->distance_to_line($line), 30, 'distance_to';
     is +Slic3r::Point->new(0, 0)->distance_to_line($line), 0, 'distance_to';
     is +Slic3r::Point->new(20, 0)->distance_to_line($line), 0, 'distance_to';
     is +Slic3r::Point->new(10, 0)->distance_to_line($line), 0, 'distance_to';
 }
 
 #==========================================================
+
+{
+    my $square = Slic3r::Polygon->new_scale(
+        [100,100],
+        [200,100],
+        [200,200],
+        [100,200],
+    );
+    is scalar(@{$square->concave_points(PI*4/3)}), 0, 'no concave vertices detected in ccw square';
+    is scalar(@{$square->convex_points(PI*2/3)}), 4, 'four convex vertices detected in ccw square';
+    
+    $square->make_clockwise;
+    is scalar(@{$square->concave_points(PI*4/3)}), 4, 'fuor concave vertices detected in cw square';
+    is scalar(@{$square->convex_points(PI*2/3)}), 0, 'no convex vertices detected in cw square';
+}
+
+{
+    my $square = Slic3r::Polygon->new_scale(
+        [150,100],
+        [200,100],
+        [200,200],
+        [100,200],
+        [100,100],
+    );
+    is scalar(@{$square->concave_points(PI*4/3)}), 0, 'no concave vertices detected in convex polygon';
+    is scalar(@{$square->convex_points(PI*2/3)}), 4, 'four convex vertices detected in square';
+}
+
+{
+    my $square = Slic3r::Polygon->new_scale(
+        [200,200],
+        [100,200],
+        [100,100],
+        [150,100],
+        [200,100],
+    );
+    is scalar(@{$square->concave_points(PI*4/3)}), 0, 'no concave vertices detected in convex polygon';
+    is scalar(@{$square->convex_points(PI*2/3)}), 4, 'four convex vertices detected in square';
+}
+
+{
+    my $triangle = Slic3r::Polygon->new(
+        [16000170,26257364], [714223,461012], [31286371,461008],
+    );
+    is scalar(@{$triangle->concave_points(PI*4/3)}), 0, 'no concave vertices detected in triangle';
+    is scalar(@{$triangle->convex_points(PI*2/3)}), 3, 'three convex vertices detected in triangle';
+}
+
+{
+    my $triangle = Slic3r::Polygon->new(
+        [16000170,26257364], [714223,461012], [20000000,461012], [31286371,461012],
+    );
+    is scalar(@{$triangle->concave_points(PI*4/3)}), 0, 'no concave vertices detected in triangle having collinear point';
+    is scalar(@{$triangle->convex_points(PI*2/3)}), 3, 'three convex vertices detected in triangle having collinear point';
+}
+
+{
+    my $triangle = Slic3r::Polygon->new(
+        [16000170,26257364], [714223,461012], [31286371,461008],
+    );
+    my $simplified = $triangle->simplify(250000)->[0];
+    is scalar(@$simplified), 3, 'triangle is never simplified to less than 3 points';
+}
+
+{
+    # Two concave vertices of this polygon have angle = PI*4/3, so this test fails
+    # if epsilon is not used.
+    my $polygon = Slic3r::Polygon->new(
+        [60246458,14802768],[64477191,12360001],[63727343,11060995],[64086449,10853608],[66393722,14850069],[66034704,15057334],[65284646,13758387],[61053864,16200839],[69200258,30310849],[62172547,42483120],[61137680,41850279],[67799985,30310848],[51399866,1905506],[38092663,1905506],[38092663,692699],[52100125,692699],
+    );
+    is scalar(@{$polygon->concave_points(PI*4/3)}), 6, 'expected number of concave points';
+    is scalar(@{$polygon->convex_points(PI*2/3)}), 10, 'expected number of convex points';
+}
+
+__END__

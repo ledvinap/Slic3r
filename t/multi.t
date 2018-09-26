@@ -1,47 +1,56 @@
-use Test::More tests => 12;
+use Test::More tests => 13;
 use strict;
 use warnings;
 
 BEGIN {
     use FindBin;
     use lib "$FindBin::Bin/../lib";
+    use local::lib "$FindBin::Bin/../local-lib";
 }
 
 use List::Util qw(first);
 use Slic3r;
 use Slic3r::Geometry qw(scale convex_hull);
+use Slic3r::Geometry::Clipper qw(offset);
 use Slic3r::Test;
 
 {
     my $config = Slic3r::Config->new_from_defaults;
+    $config->set('layer_height', 0.3);
+    $config->set('first_layer_height', 0.35);
     $config->set('raft_layers', 2);
     $config->set('infill_extruder', 2);
-    $config->set('support_material_extruder', 3);
+    $config->set('solid_infill_extruder', 3);
+    $config->set('support_material_extruder', 4);
     $config->set('ooze_prevention', 1);
-    $config->set('extruder_offset', [ [0,0], [20,0], [0,20] ]);
-    $config->set('temperature', [200, 180, 170]);
-    $config->set('first_layer_temperature', [206, 186, 166]);
+    $config->set('extruder_offset', [ [0,0], [20,0], [0,20], [20,20] ]);
+    $config->set('temperature', [200, 180, 170, 160]);
+    $config->set('first_layer_temperature', [206, 186, 166, 156]);
+    $config->set('standby_temperature_delta', -5);
     $config->set('toolchange_gcode', ';toolchange');  # test that it doesn't crash when this is supplied
+    $config->set('skirts', 2);  # test correct temperatures are applied to skirt as well
     
     my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
     
     my $tool = undef;
-    my @tool_temp = (0,0,0);
+    my @tool_temp = (0,0,0,0);
     my @toolchange_points = ();
     my @extrusion_points = ();
     Slic3r::GCode::Reader->new->parse(Slic3r::Test::gcode($print), sub {
         my ($self, $cmd, $args, $info) = @_;
         
         if ($cmd =~ /^T(\d+)/) {
+            # ignore initial toolchange
             if (defined $tool) {
                 my $expected_temp = $self->Z == ($config->get_value('first_layer_height') + $config->z_offset)
                     ? $config->first_layer_temperature->[$tool]
                     : $config->temperature->[$tool];
                 die 'standby temperature was not set before toolchange'
                     if $tool_temp[$tool] != $expected_temp + $config->standby_temperature_delta;
+                
+                push @toolchange_points, my $point = Slic3r::Point->new_scale($self->X, $self->Y);
             }
             $tool = $1;
-            push @toolchange_points, Slic3r::Point->new_scale($self->X, $self->Y);
         } elsif ($cmd eq 'M104' || $cmd eq 'M109') {
             my $t = $args->{T} // $tool;
             if ($tool_temp[$t] == 0) {
@@ -51,11 +60,47 @@ use Slic3r::Test;
             $tool_temp[$t] = $args->{S};
         } elsif ($cmd eq 'G1' && $info->{extruding} && $info->{dist_XY} > 0) {
             push @extrusion_points, my $point = Slic3r::Point->new_scale($args->{X}, $args->{Y});
-            $point->translate(map scale($_), @{ $config->extruder_offset->[$tool] });
+            $point->translate(map +scale($_), @{ $config->extruder_offset->[$tool] });
+            
+            # check temperature (we don't do it at M104/M109 because that may be
+            # issued before layer change)
+            if ($self->Z == $config->first_layer_height) {
+                fail 'unexpected temperature in first layer'
+                    unless $tool_temp[$tool] == ($config->first_layer_temperature->[$tool] + $config->standby_temperature_delta)
+                        || $tool_temp[$tool] == $config->first_layer_temperature->[$tool];
+            } else {
+                fail 'unexpected temperature'
+                    unless $tool_temp[$tool] == ($config->temperature->[$tool] + $config->standby_temperature_delta)
+                        || $tool_temp[$tool] == $config->temperature->[$tool];
+            }
         }
     });
     my $convex_hull = convex_hull(\@extrusion_points);
-    ok !(first { $convex_hull->contains_point($_) } @toolchange_points), 'all toolchanges happen outside skirt';
+    
+    my @t = ();
+    foreach my $point (@toolchange_points) {
+        foreach my $offset (@{$config->extruder_offset}) {
+            push @t, my $p = $point->clone;
+            $p->translate(map +scale($_), @$offset);
+        }
+    }
+    ok !(defined first { $convex_hull->contains_point($_) } @t), 'all nozzles are outside skirt at toolchange';
+    
+    if (0) {
+        require "Slic3r/SVG.pm";
+        Slic3r::SVG::output(
+            "ooze_prevention_test.svg",
+            no_arrows   => 1,
+            polygons    => [$convex_hull],
+            red_points  => \@t,
+            points      => \@toolchange_points,
+        );
+    }
+    
+    # offset the skirt by the maximum displacement between extruders plus a safety extra margin
+    my $delta = scale(20 * sqrt(2) + 1);
+    my $outer_convex_hull = offset([$convex_hull], +$delta)->[0];
+    ok !(defined first { !$outer_convex_hull->contains_point($_) } @toolchange_points), 'all toolchanges happen within expected area';
 }
 
 {
@@ -140,13 +185,16 @@ use Slic3r::Test;
 
 {
     my $model = stacked_cubes();
+    my $object = $model->objects->[0];
     
     my $config = Slic3r::Config->new_from_defaults;
+    $config->set('layer_height', 0.4);
+    $config->set('first_layer_height', '100%');
     $config->set('skirts', 0);
     my $print = Slic3r::Test::init_print($model, config => $config);
     
-    is $model->get_material('lower')->config->extruder, 1, 'auto_assign_extruders() assigned correct extruder to first volume';
-    is $model->get_material('upper')->config->extruder, 2, 'auto_assign_extruders() assigned correct extruder to second volume';
+    is $object->volumes->[0]->config->extruder, 1, 'auto_assign_extruders() assigned correct extruder to first volume';
+    is $object->volumes->[1]->config->extruder, 2, 'auto_assign_extruders() assigned correct extruder to second volume';
     
     my $tool = undef;
     my %T0 = my %T1 = ();  # Z => 1
@@ -173,7 +221,7 @@ sub stacked_cubes {
     my $object = $model->add_object;
     $object->add_volume(mesh => Slic3r::Test::mesh('20mm_cube'), material_id => 'lower');
     $object->add_volume(mesh => Slic3r::Test::mesh('20mm_cube', translate => [0,0,20]), material_id => 'upper');
-    $object->add_instance(offset => [0,0]);
+    $object->add_instance(offset => Slic3r::Pointf->new(0,0));
     
     return $model;
 }
